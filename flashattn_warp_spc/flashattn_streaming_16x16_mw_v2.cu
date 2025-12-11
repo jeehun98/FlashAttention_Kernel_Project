@@ -454,11 +454,8 @@ int main() {
 
 /*
 빌드:
-nvcc -O3 -std=c++17 -arch=sm_86 \
-  -o flashattn_streaming_16x16_mw_v2.exe \
-  flashattn_streaming_16x16_mw_v2.cu
+nvcc -O3 -std=c++17 -arch=sm_86   -o flashattn_streaming_16x16_mw_v2.exe   flashattn_streaming_16x16_mw_v2.cu
 
 프로파일:
-ncu --set full --launch-skip 10 --launch-count 1 \
-  ./flashattn_streaming_16x16_mw_v2.exe
+ncu --set full --launch-skip 10 --launch-count 1   ./flashattn_streaming_16x16_mw_v2.exe
 */
