@@ -1,18 +1,16 @@
-// flashattn_streaming_16x16_mw_v6_1.cu
-// v6.1: v6 정합성 fix (cp.async wait는 발사한 warp0가 해야 함)
-// - block: 2 warps (64 threads)
-// - warp0: loader (cp.async global->shared + wait_group0)
-// - warp1: compute (WMMA QK^T + streaming softmax + PV)
-// - NOTE: mbarrier 없이 안전하게 가려고 tile마다 __syncthreads() 유지
+// flashattn_streaming_16x16_mw_v10.cu
+// v10: Ampere-final baseline (no mbarrier)
+// - K is transposed on host: K_T [B, L, Kdim]
+// - WMMA: matrix_b col_major (interprets K_T as B col-major)
+// - cp.async ping-pong (K_T + V) with shared padding
+// - Synchronization: ONE __syncthreads() per tile boundary
+//   (warp0 does cp.async.wait_group0 BEFORE the barrier)
 //
 // Build:
-// nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo \
-//   -o flashattn_streaming_16x16_mw_v6_1.exe \
-//   flashattn_streaming_16x16_mw_v6_1.cu
+// nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo    -o flashattn_streaming_16x16_mw_v10.exe    flashattn_streaming_16x16_mw_v10.cu
 //
 // Profile:
-// ncu --set full --launch-skip 10 --launch-count 1 \
-//   ./flashattn_streaming_16x16_mw_v6_1.exe
+// ncu --set full --launch-skip 10 --launch-count 1    ./flashattn_streaming_16x16_mw_v10.exe
 
 #include <cstdio>
 #include <vector>
@@ -20,6 +18,8 @@
 #include <cmath>
 #include <cfloat>
 #include <cstdlib>
+#include <algorithm>
+#include <cstdint>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -43,6 +43,12 @@ constexpr int Kdim     = 16;
 constexpr int Dv       = 16;
 constexpr int N_TILE   = 16;
 
+// cp.async 16B alignment constraints:
+// - destination shared address must be 16B-aligned
+// - we copy 16B per lane into shK/shV
+constexpr int PAD_K = 8;   // 8 half = 16B
+constexpr int PAD_V = 8;   // 8 half = 16B
+
 constexpr float NEG_LARGE = -1e30f;
 constexpr float EPS       = 1e-6f;
 
@@ -56,7 +62,6 @@ __inline__ __device__ float warp_allreduce_max(float v) {
     v = fmaxf(v, __shfl_xor_sync(mask, v,  1));
     return v;
 }
-
 __inline__ __device__ float warp_allreduce_sum(float v) {
     unsigned mask = 0xffffffffu;
     v += __shfl_xor_sync(mask, v, 16);
@@ -68,7 +73,6 @@ __inline__ __device__ float warp_allreduce_sum(float v) {
 }
 
 // ---------------- cp.async helpers (Ampere+) ----------------
-// NOTE: shared operand must be 32-bit shared address
 __device__ __forceinline__ void cp_async_cg_16B(void* smem_dst, const void* gmem_src) {
 #if __CUDA_ARCH__ >= 800
     unsigned int smem_u32 = static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
@@ -81,13 +85,11 @@ __device__ __forceinline__ void cp_async_cg_16B(void* smem_dst, const void* gmem
     (void)smem_dst; (void)gmem_src;
 #endif
 }
-
 __device__ __forceinline__ void cp_async_commit_group() {
 #if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;\n" ::: "memory");
 #endif
 }
-
 __device__ __forceinline__ void cp_async_wait_group0() {
 #if __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
@@ -95,13 +97,13 @@ __device__ __forceinline__ void cp_async_wait_group0() {
 }
 
 // ---------------- kernel ----------------
-// Q: [B, M, Kdim] half
-// K: [B, Kdim, L] half  (row-major, ld = L)
-// V: [B, L, Dv]   half
-// O: [B, M, Dv]   float
-__global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
+// Q:   [B, M, Kdim]    half
+// K_T: [B, L, Kdim]    half   (transposed on host)
+// V:   [B, L, Dv]      half
+// O:   [B, M, Dv]      float
+__global__ void flashattn_streaming_16x16_kernel_mw_v10(
     const __half* __restrict__ Q,
-    const __half* __restrict__ K,
+    const __half* __restrict__ K_T,
     const __half* __restrict__ V,
     float* __restrict__ O,
     int num_batches,
@@ -118,22 +120,22 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
     int lane = tid & (WARP_SIZE - 1);
     int warp = tid >> 5; // 0,1
 
-    const __half* Q_b = Q + static_cast<size_t>(batch_id) * M * Kdim;
-    const __half* K_b = K + static_cast<size_t>(batch_id) * Kdim * seq_len;
-    const __half* V_b = V + static_cast<size_t>(batch_id) * seq_len * Dv;
-    float*       O_b  = O + static_cast<size_t>(batch_id) * M * Dv;
-
-    // warp1: Q fragment
-    wmma::fragment<wmma::matrix_a, M, N_TILE, Kdim, __half, wmma::row_major> q_frag;
-    if (warp == 1) {
-        wmma::load_matrix_sync(q_frag, Q_b, Kdim);
-    }
+    const __half* Q_b  = Q   + static_cast<size_t>(batch_id) * M * Kdim;
+    const __half* KT_b = K_T + static_cast<size_t>(batch_id) * seq_len * Kdim;
+    const __half* V_b  = V   + static_cast<size_t>(batch_id) * seq_len * Dv;
+    float*       O_b   = O   + static_cast<size_t>(batch_id) * M * Dv;
 
     // running state
     __shared__ float sh_m_running[M];
     __shared__ float sh_l_running[M];
     __shared__ float sh_y_running[M][Dv];
 
+    // ping-pong buffers (force 16B alignment for cp.async destinations)
+    __shared__ alignas(16) __half shK[2][N_TILE][Kdim + PAD_K]; // [tile_n][k]
+    __shared__ alignas(16) __half shV[2][N_TILE][Dv   + PAD_V]; // [tile_n][d]
+    __shared__ alignas(16) float  s_scores[M * N_TILE];
+
+    // init running state
     for (int i = tid; i < M; i += blockDim.x) {
         sh_m_running[i] = NEG_LARGE;
         sh_l_running[i] = 0.0f;
@@ -142,31 +144,30 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
     }
     __syncthreads();
 
-    // ping-pong buffers
-    __shared__ __half shK[2][Kdim][N_TILE]; // [Kdim][N_TILE]
-    __shared__ __half shV[2][N_TILE][Dv];   // [N_TILE][Dv]
-    __shared__ float  s_scores[M * N_TILE];
+    // warp1: Q fragment
+    wmma::fragment<wmma::matrix_a, M, N_TILE, Kdim, __half, wmma::row_major> q_frag;
+    if (warp == 1) {
+        wmma::load_matrix_sync(q_frag, Q_b, Kdim);
+    }
 
     int num_tiles = seq_len / N_TILE;
 
-    // ---- helper lambda: warp0 loads one tile t into buf ----
-    auto load_tile_cpasync = [&](int t, int buf) {
+    // ---- warp0 issues cp.async for tile t into buf ----
+    auto issue_tile_cpasync = [&](int t, int buf) {
         int col_start = t * N_TILE;
 
-        // lane 0..31 -> (k,rowseg) mapping
-        // Each lane copies 16B from K row and 16B from V row.
+        // lane 0..31 -> token n and segment seg
         int idx   = lane;       // 0..31
-        int k     = idx >> 1;   // 0..15
+        int n     = idx >> 1;   // 0..15
         int seg   = idx & 1;    // 0/1
         int off_h = seg * 8;    // 8 half = 16B
 
-        // K: row k, columns col_start + off_h .. + off_h+7
-        const __half* gK = K_b + k * seq_len + (col_start + off_h);
-        __half* sK = &shK[buf][k][off_h];
+        // K_T: [L, Kdim], contiguous in Kdim
+        const __half* gK = KT_b + (col_start + n) * Kdim + off_h;
+        __half* sK = &shK[buf][n][off_h];
         cp_async_cg_16B(sK, gK);
 
-        // V: row n=k, columns off_h..off_h+7 in Dv
-        int n = k;
+        // V: [L, Dv]
         const __half* gV = V_b + (col_start + n) * Dv + off_h;
         __half* sV = &shV[buf][n][off_h];
         cp_async_cg_16B(sV, gV);
@@ -176,34 +177,36 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
 
     // ---- preload tile0 into buf0 ----
     if (warp == 0) {
-        load_tile_cpasync(0, 0);
+        issue_tile_cpasync(0, 0);
+        // wait must be executed by issuer warp
+        cp_async_wait_group0();
     }
-
-    // IMPORTANT: wait must be executed by issuer warp0
-    __syncthreads();
-    if (warp == 0) cp_async_wait_group0();
+    // single barrier makes tile0 visible to warp1
     __syncthreads();
 
+    // ---- main loop ----
     for (int t = 0; t < num_tiles; ++t) {
         int cur = t & 1;
         int nxt = cur ^ 1;
 
-        // prefetch next tile into nxt
+        // prefetch next tile early (overlapped with compute)
         if (warp == 0 && (t + 1) < num_tiles) {
-            load_tile_cpasync(t + 1, nxt);
+            issue_tile_cpasync(t + 1, nxt);
         }
 
-        // compute cur
+        // compute current tile
         if (warp == 1) {
-            wmma::fragment<wmma::matrix_b, M, N_TILE, Kdim, __half, wmma::row_major> k_frag;
+            wmma::fragment<wmma::matrix_b, M, N_TILE, Kdim, __half, wmma::col_major> k_frag;
             wmma::fragment<wmma::accumulator, M, N_TILE, Kdim, float> c_frag;
             wmma::fill_fragment(c_frag, 0.0f);
 
-            wmma::load_matrix_sync(k_frag, &shK[cur][0][0], N_TILE);
+            // shK[cur] is laid out [N_TILE][Kdim+PAD_K] row-major in C,
+            // but WMMA col_major interprets leading dimension as (Kdim+PAD_K)
+            wmma::load_matrix_sync(k_frag, &shK[cur][0][0], Kdim + PAD_K);
             wmma::mma_sync(c_frag, q_frag, k_frag, c_frag);
             wmma::store_matrix_sync(s_scores, c_frag, N_TILE, wmma::mem_row_major);
 
-            // streaming softmax + PV
+            // streaming softmax + PV (per row i)
             for (int i = 0; i < M; ++i) {
                 float x = (lane < N_TILE) ? (s_scores[i * N_TILE + lane] * scale) : NEG_LARGE;
                 float maxv = warp_allreduce_max(x);
@@ -257,11 +260,12 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
             }
         }
 
-        // before next tile compute, ensure nxt is ready (issuer warp0 waits)
+        // prepare next tile: warp0 waits, then one barrier for visibility
         if ((t + 1) < num_tiles) {
-            __syncthreads();
-            if (warp == 0) cp_async_wait_group0();
-            __syncthreads();
+            if (warp == 0) {
+                cp_async_wait_group0(); // must be done by issuer warp0
+            }
+            __syncthreads(); // single barrier per tile boundary
         }
     }
 
@@ -276,10 +280,10 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
     }
 }
 
-// ---------------- CPU reference ----------------
+// ---------------- CPU reference (uses original K: [Kdim, L]) ----------------
 void flashattn_streaming_cpu_ref(
     const std::vector<__half>& hQ,
-    const std::vector<__half>& hK,
+    const std::vector<__half>& hK,   // [B, Kdim, L]
     const std::vector<__half>& hV,
     std::vector<float>& hO_ref,
     int num_batches,
@@ -333,8 +337,26 @@ void flashattn_streaming_cpu_ref(
     }
 }
 
+// ---------------- host helper: K -> K_T ----------------
+static void transpose_K_host(
+    const std::vector<__half>& hK,   // [B, Kdim, L]
+    std::vector<__half>& hK_T,       // [B, L, Kdim]
+    int num_batches,
+    int seq_len
+) {
+    for (int b = 0; b < num_batches; ++b) {
+        const __half* Kb = hK.data() + static_cast<size_t>(b) * Kdim * seq_len;
+        __half*      Tb  = hK_T.data() + static_cast<size_t>(b) * seq_len * Kdim;
+        for (int k = 0; k < Kdim; ++k) {
+            for (int j = 0; j < seq_len; ++j) {
+                Tb[j * Kdim + k] = Kb[k * seq_len + j];
+            }
+        }
+    }
+}
+
 int main() {
-    std::printf("Streaming Softmax FlashAttention-like Multi-Warp (v6.1: cp.async wait fix)\n");
+    std::printf("Streaming Softmax FlashAttention-like Multi-Warp (v10: Ampere final, 1 barrier/tile)\n");
 
     constexpr int NUM_BATCH   = 1024;
     constexpr int NUM_K_TILES = 8;
@@ -349,7 +371,8 @@ int main() {
     std::normal_distribution<float> dist(0.0f, 1.0f);
 
     std::vector<__half> hQ(num_batches * M * Kdim);
-    std::vector<__half> hK(num_batches * Kdim * seq_len);
+    std::vector<__half> hK(num_batches * Kdim * seq_len);      // original layout
+    std::vector<__half> hK_T(num_batches * seq_len * Kdim);    // transposed
     std::vector<__half> hV(num_batches * seq_len * Dv);
     std::vector<float>  hO_ref(num_batches * M * Dv);
     std::vector<float>  hO(num_batches * M * Dv);
@@ -358,25 +381,27 @@ int main() {
     for (int i = 0; i < (int)hK.size(); ++i) hK[i] = __float2half(dist(rng));
     for (int i = 0; i < (int)hV.size(); ++i) hV[i] = __float2half(dist(rng));
 
+    transpose_K_host(hK, hK_T, num_batches, seq_len);
+
     flashattn_streaming_cpu_ref(hQ, hK, hV, hO_ref, num_batches, seq_len, scale);
 
-    __half *dQ=nullptr, *dK=nullptr, *dV=nullptr;
+    __half *dQ=nullptr, *dKT=nullptr, *dV=nullptr;
     float *dO=nullptr;
 
-    CHECK_CUDA(cudaMalloc(&dQ, hQ.size() * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&dK, hK.size() * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&dV, hV.size() * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&dO, hO.size() * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&dQ,  hQ.size()   * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&dKT, hK_T.size() * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&dV,  hV.size()   * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&dO,  hO.size()   * sizeof(float)));
 
-    CHECK_CUDA(cudaMemcpy(dQ, hQ.data(), hQ.size() * sizeof(__half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(dK, hK.data(), hK.size() * sizeof(__half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(dV, hV.data(), hV.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dQ,  hQ.data(),   hQ.size()   * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dKT, hK_T.data(), hK_T.size() * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(dV,  hV.data(),   hV.size()   * sizeof(__half), cudaMemcpyHostToDevice));
 
     dim3 block(64,1,1);
     dim3 grid(num_batches,1,1);
 
     // correctness
-    flashattn_streaming_16x16_kernel_mw_v6_1<<<grid, block>>>(dQ,dK,dV,dO,num_batches,seq_len,scale);
+    flashattn_streaming_16x16_kernel_mw_v10<<<grid, block>>>(dQ,dKT,dV,dO,num_batches,seq_len,scale);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(hO.data(), dO, hO.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -405,7 +430,7 @@ int main() {
 
     CHECK_CUDA(cudaEventRecord(start));
     for(int it=0; it<NUM_ITERS; ++it){
-        flashattn_streaming_16x16_kernel_mw_v6_1<<<grid, block>>>(dQ,dK,dV,dO,num_batches,seq_len,scale);
+        flashattn_streaming_16x16_kernel_mw_v10<<<grid, block>>>(dQ,dKT,dV,dO,num_batches,seq_len,scale);
     }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -414,9 +439,10 @@ int main() {
     CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
     ms /= NUM_ITERS;
 
+    // Keep a consistent FLOPs model for version comparison
     double flops_per_batch =
-        2.0 * M * seq_len * Kdim +
-        6.0 * M * seq_len * Dv;
+        2.0 * M * seq_len * Kdim +   // QK
+        2.0 * M * seq_len * Dv;      // PV
     double total_flops = flops_per_batch * num_batches;
     double sec = ms * 1e-3;
     double tflops = (total_flops / sec) / 1e12;
@@ -425,17 +451,10 @@ int main() {
     std::printf("Approx TFLOPS  : %f\n", tflops);
 
     CHECK_CUDA(cudaFree(dQ));
-    CHECK_CUDA(cudaFree(dK));
+    CHECK_CUDA(cudaFree(dKT));
     CHECK_CUDA(cudaFree(dV));
     CHECK_CUDA(cudaFree(dO));
     CHECK_CUDA(cudaEventDestroy(start));
     CHECK_CUDA(cudaEventDestroy(stop));
     return 0;
 }
-/*
-Build:
-nvcc -O3 -std=c++17 -arch=sm_86   -o flashattn_streaming_16x16_mw_v6.exe   flashattn_streaming_16x16_mw_v6.cu
-
-Profile:
-ncu --set full --launch-skip 10 --launch-count 1   ./flashattn_streaming_16x16_mw_v6.exe
-*/
