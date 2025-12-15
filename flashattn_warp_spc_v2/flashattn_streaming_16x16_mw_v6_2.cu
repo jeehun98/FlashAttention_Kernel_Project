@@ -1,18 +1,15 @@
-// flashattn_streaming_16x16_mw_v6_1.cu
-// v6.1: v6 정합성 fix (cp.async wait는 발사한 warp0가 해야 함)
+// flashattn_streaming_16x16_mw_v6_2.cu
+// v6.2: reduce CTA barrier frequency (tile boundary: 2x __syncthreads -> 1x)
 // - block: 2 warps (64 threads)
 // - warp0: loader (cp.async global->shared + wait_group0)
 // - warp1: compute (WMMA QK^T + streaming softmax + PV)
-// - NOTE: mbarrier 없이 안전하게 가려고 tile마다 __syncthreads() 유지
+// - still no mbarrier: we keep correctness by doing 1 block-wide sync per tile
 //
 // Build:
-// nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo \
-//   -o flashattn_streaming_16x16_mw_v6_1.exe \
-//   flashattn_streaming_16x16_mw_v6_1.cu
+// nvcc -O3 -std=c++17 -arch=sm_86 -lineinfo    -o flashattn_streaming_16x16_mw_v6_2.exe    flashattn_streaming_16x16_mw_v6_2.cu
 //
-// Profile:
-// ncu --set full --launch-skip 10 --launch-count 1 \
-//   ./flashattn_streaming_16x16_mw_v6_1.exe
+// Profile (lighter is recommended):
+// ncu --section SpeedOfLight --section MemoryWorkloadAnalysis --section WarpStateStats    --target-processes all --launch-skip 10 --launch-count 1    -o ncu_v6_2 ./flashattn_streaming_16x16_mw_v6_2.exe
 
 #include <cstdio>
 #include <vector>
@@ -99,7 +96,7 @@ __device__ __forceinline__ void cp_async_wait_group0() {
 // K: [B, Kdim, L] half  (row-major, ld = L)
 // V: [B, L, Dv]   half
 // O: [B, M, Dv]   float
-__global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
+__global__ void flashattn_streaming_16x16_kernel_mw_v6_2(
     const __half* __restrict__ Q,
     const __half* __restrict__ K,
     const __half* __restrict__ V,
@@ -171,18 +168,16 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
         __half* sV = &shV[buf][n][off_h];
         cp_async_cg_16B(sV, gV);
 
+        // Commit after issuing this lane's copies (warp-synchronous semantics)
         cp_async_commit_group();
     };
 
     // ---- preload tile0 into buf0 ----
     if (warp == 0) {
         load_tile_cpasync(0, 0);
+        cp_async_wait_group0();              // v6.2 change: wait before the first sync
     }
-
-    // IMPORTANT: wait must be executed by issuer warp0
-    __syncthreads();
-    if (warp == 0) cp_async_wait_group0();
-    __syncthreads();
+    __syncthreads();                         // v6.2 change: only ONE sync to publish tile0 to warp1
 
     for (int t = 0; t < num_tiles; ++t) {
         int cur = t & 1;
@@ -257,11 +252,11 @@ __global__ void flashattn_streaming_16x16_kernel_mw_v6_1(
             }
         }
 
-        // before next tile compute, ensure nxt is ready (issuer warp0 waits)
+        // v6.2 change: tile boundary sync reduced to ONE __syncthreads()
+        // Ensure nxt is ready before warp1 uses it in the next iteration.
         if ((t + 1) < num_tiles) {
-            __syncthreads();
             if (warp == 0) cp_async_wait_group0();
-            __syncthreads();
+            __syncthreads(); // publish nxt to warp1
         }
     }
 
@@ -334,7 +329,7 @@ void flashattn_streaming_cpu_ref(
 }
 
 int main() {
-    std::printf("Streaming Softmax FlashAttention-like Multi-Warp (v6.1: cp.async wait fix)\n");
+    std::printf("Streaming Softmax FlashAttention-like Multi-Warp (v6.2: reduce CTA barriers)\n");
 
     constexpr int NUM_BATCH   = 1024;
     constexpr int NUM_K_TILES = 8;
@@ -376,7 +371,7 @@ int main() {
     dim3 grid(num_batches,1,1);
 
     // correctness
-    flashattn_streaming_16x16_kernel_mw_v6_1<<<grid, block>>>(dQ,dK,dV,dO,num_batches,seq_len,scale);
+    flashattn_streaming_16x16_kernel_mw_v6_2<<<grid, block>>>(dQ,dK,dV,dO,num_batches,seq_len,scale);
     CHECK_CUDA(cudaGetLastError());
     CHECK_CUDA(cudaDeviceSynchronize());
     CHECK_CUDA(cudaMemcpy(hO.data(), dO, hO.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -397,7 +392,7 @@ int main() {
     std::printf("\nRelative L2 error over all batches: %.12e\n", rel_l2);
     std::printf("NUM_BATCH=%d, SEQ_LEN=%d, M=Kdim=Dv=16\n", num_batches, seq_len);
 
-    // perf
+    // perf (NOTE: do NOT trust timings under `ncu --set full`)
     const int NUM_ITERS=50;
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
@@ -405,7 +400,7 @@ int main() {
 
     CHECK_CUDA(cudaEventRecord(start));
     for(int it=0; it<NUM_ITERS; ++it){
-        flashattn_streaming_16x16_kernel_mw_v6_1<<<grid, block>>>(dQ,dK,dV,dO,num_batches,seq_len,scale);
+        flashattn_streaming_16x16_kernel_mw_v6_2<<<grid, block>>>(dQ,dK,dV,dO,num_batches,seq_len,scale);
     }
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
@@ -432,11 +427,3 @@ int main() {
     CHECK_CUDA(cudaEventDestroy(stop));
     return 0;
 }
-/*
-Build:
-nvcc -O3 -std=c++17 -arch=sm_86   -o flashattn_streaming_16x16_mw_v6.exe   flashattn_streaming_16x16_mw_v6.cu
-ncu --set full --target-processes all --launch-skip 10 --launch-count 1     -o ncu_full_v6_1 ./flashattn_streaming_16x16_mw_v6_1.exe
-
-Profile:
-ncu --set full --launch-skip 10 --launch-count 1   ./flashattn_streaming_16x16_mw_v6.exe
-*/
